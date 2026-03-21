@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+import zstandard as zstd
 import zlib
 from pathlib import Path
 
@@ -313,6 +314,7 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+INT8_GROUP_SIZE = 128
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -328,6 +330,16 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
+        # Per-group quantization for better resolution
+        rows, cols = t32.shape
+        if cols % INT8_GROUP_SIZE == 0:
+            t_grouped = t32.view(rows, cols // INT8_GROUP_SIZE, INT8_GROUP_SIZE)
+            clip_abs = torch.quantile(t_grouped.abs(), INT8_CLIP_Q, dim=2, keepdim=True)
+            scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+            q_grouped = torch.clamp(torch.round(torch.clamp(t_grouped, -clip_abs, clip_abs) / scale), -127, 127)
+            q = q_grouped.view(rows, cols).to(torch.int8).contiguous()
+            return q, scale.view(rows, cols // INT8_GROUP_SIZE).to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+
         # Matrices get one scale per row, which usually tracks output-channel
         # ranges much better than a single tensor-wide scale.
         clip_abs = (
@@ -412,7 +424,15 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+        if s.ndim == 2:
+            # Per-group scales
+            s = s.to(dtype=torch.float32)
+            rows, cols = q.shape
+            num_groups = s.shape[1]
+            group_size = cols // num_groups
+            q_grouped = q.view(rows, num_groups, group_size)
+            out[name] = (q_grouped.float() * s.unsqueeze(-1)).view(rows, cols).to(dtype=dtype).contiguous()
+        elif qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
             # Broadcast the saved row scale back across trailing dimensions.
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
@@ -1309,7 +1329,11 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    
+    # Use zstd for better compression
+    cctx = zstd.ZstdCompressor(level=22) # Max compression level
+    quant_blob = cctx.compress(quant_raw)
+    
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
@@ -1318,16 +1342,19 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"Serialized model int8+zstd: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size int8+zstd: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    
+    # Decompress with zstd
+    dctx = zstd.ZstdDecompressor()
+    quant_state = torch.load(io.BytesIO(dctx.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
@@ -1345,10 +1372,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_int8_zstd_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_int8_zstd_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     # LoRA test-time training evaluation (the competition score)
     torch._dynamo.reset()
