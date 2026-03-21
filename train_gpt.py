@@ -377,6 +377,28 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
+        
+        # Experimental: SVD compression for large linear layers
+        # (This is just one approach to explore 'more compression')
+        if t.ndim == 2 and any(p in name for p in ["attn.qkv", "attn.proj", "mlp.fc1", "mlp.fc2"]):
+            U, S, V = torch.svd(t.float())
+            k = max(1, int(S.numel() * 0.7)) # Keep 70% of singular values
+            U_k = U[:, :k] * torch.sqrt(S[:k])
+            V_k = V[:, :k] * torch.sqrt(S[:k])
+            
+            # Store as two smaller matrices
+            for sub_name, sub_t in [(f"{name}.svd_u", U_k), (f"{name}.svd_v", V_k)]:
+                stats["param_count"] += int(sub_t.numel())
+                stats["num_tensors"] += 1
+                stats["baseline_tensor_bytes"] += tensor_nbytes(sub_t)
+                stats["num_float_tensors"] += 1
+                q, s = quantize_float_tensor(sub_t)
+                quantized[sub_name] = q
+                scales[sub_name] = s
+                dtypes[sub_name] = str(t.dtype).removeprefix("torch.")
+                stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+            continue
+
         stats["param_count"] += int(t.numel())
         stats["num_tensors"] += 1
         stats["baseline_tensor_bytes"] += tensor_nbytes(t)
@@ -421,24 +443,40 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     qmeta = obj.get("qmeta", {})
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
+    
+    # First, dequantize everything
+    dequantized: dict[str, Tensor] = {}
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
         if s.ndim == 2:
-            # Per-group scales
             s = s.to(dtype=torch.float32)
             rows, cols = q.shape
             num_groups = s.shape[1]
             group_size = cols // num_groups
             q_grouped = q.view(rows, num_groups, group_size)
-            out[name] = (q_grouped.float() * s.unsqueeze(-1)).view(rows, cols).to(dtype=dtype).contiguous()
+            dequantized[name] = (q_grouped.float() * s.unsqueeze(-1)).view(rows, cols).to(dtype=dtype).contiguous()
         elif qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
-            # Broadcast the saved row scale back across trailing dimensions.
-            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
+            dequantized[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
         else:
             scale = float(s.item())
-            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
+            dequantized[name] = (q.float() * scale).to(dtype=dtype).contiguous()
+    
+    # Reconstruct SVD matrices
+    svd_roots = set()
+    for name in list(dequantized.keys()):
+        if ".svd_u" in name:
+            root = name.replace(".svd_u", "")
+            svd_roots.add(root)
+            u = dequantized[name]
+            v = dequantized[root + ".svd_v"]
+            out[root] = (u @ v.T).contiguous()
+        elif ".svd_v" in name:
+            continue
+        else:
+            out[name] = dequantized[name]
+
     for name, t in obj["passthrough"].items():
         # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_t = t.detach().to("cpu").contiguous()
