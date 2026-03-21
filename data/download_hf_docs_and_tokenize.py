@@ -109,26 +109,52 @@ def copy_from_hf_cache(*, repo_id: str, remote_root: str, filename: str, destina
     return True
 
 
-def iter_docs(path: Path):
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            yield json.loads(line)["text"]
+import requests
+from huggingface_hub import hf_hub_url, hf_hub_download
 
+def stream_docs(repo_id: str, remote_root: str, filename: str, limit_docs: int | None = None):
+    url = hf_hub_url(repo_id=repo_id, filename=f"{remote_root}/{filename}" if remote_root else filename, repo_type="dataset")
+    response = requests.get(url, stream=True)
+    response.raise_for_status()
+    
+    count = 0
+    buffer = ""
+    for chunk in response.iter_content(chunk_size=1024 * 1024):
+        if chunk:
+            buffer += chunk.decode("utf-8", errors="replace")
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                if line.strip():
+                    yield json.loads(line)["text"]
+                    count += 1
+                    if limit_docs is not None and count >= limit_docs:
+                        return
 
-def count_docs(path: Path) -> int:
-    with path.open("r", encoding="utf-8") as f:
-        return sum(1 for _ in f)
+def iter_docs(path: Path | None, repo_id: str = "", remote_root: str = "", limit_docs: int | None = None):
+    if path and path.exists():
+        with path.open("r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if limit_docs is not None and i >= limit_docs:
+                    break
+                yield json.loads(line)["text"]
+    else:
+        yield from stream_docs(repo_id, remote_root, DOCS_FILENAME, limit_docs)
 
-
-def batched_docs_jsonl(path: Path, batch_size: int):
+def batched_docs_jsonl(path: Path | None, batch_size: int, repo_id: str = "", remote_root: str = "", limit_docs: int | None = None):
     batch: list[str] = []
-    for text in iter_docs(path):
+    for text in iter_docs(path, repo_id, remote_root, limit_docs):
         batch.append(text)
         if len(batch) == batch_size:
             yield batch
             batch = []
     if batch:
         yield batch
+
+def _iter_sentencepiece_text(docs_jsonl: Path | None, *, max_docs: int | None = None, repo_id: str = "", remote_root: str = ""):
+    for i, text in enumerate(iter_docs(docs_jsonl, repo_id, remote_root, max_docs)):
+        text = text.replace("\x00", " ").strip()
+        if text:
+            yield text
 
 
 def write_datafile(path: Path, toks: Any) -> None:
@@ -245,7 +271,7 @@ def build_pure_byte_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tokeniz
     }
 
 
-def build_sentencepiece_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tokenizers_dir: Path) -> dict[str, Any]:
+def build_sentencepiece_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path | None, tokenizers_dir: Path, repo_id: str = "", remote_root: str = "") -> dict[str, Any]:
     try:
         import sentencepiece as spm
     except ImportError as exc:
@@ -274,6 +300,8 @@ def build_sentencepiece_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tok
             "sentence_iterator": _iter_sentencepiece_text(
                 docs_jsonl,
                 max_docs=None if spec.get("tokenizer_train_docs") is None else int(spec["tokenizer_train_docs"]),
+                repo_id=repo_id,
+                remote_root=remote_root,
             ),
             "model_prefix": str(prefix),
             "model_type": "bpe",
@@ -307,13 +335,15 @@ def build_sentencepiece_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tok
 
 
 def export_shards(
-    docs_jsonl: Path,
+    docs_jsonl: Path | None,
     tok: dict[str, Any],
     output_dir: Path,
     *,
     num_val_docs: int,
     shard_size: int,
     docs_total: int,
+    repo_id: str = "",
+    remote_root: str = "",
 ) -> dict[str, int]:
     output_dir.mkdir(parents=True, exist_ok=True)
     for pattern in ("fineweb_train_*.bin", "fineweb_val_*.bin"):
@@ -352,7 +382,7 @@ def export_shards(
 
     batch_encode = tok.get("encode_batch")
     batch_size = SP_BATCH_SIZE if callable(batch_encode) else 1
-    for texts in batched_docs_jsonl(docs_jsonl, batch_size):
+    for texts in batched_docs_jsonl(docs_jsonl, batch_size, repo_id, remote_root, limit_docs=docs_total):
         encoded_docs = batch_encode(texts) if callable(batch_encode) else [tok["encode"](text) for text in texts]
         for text, encoded in zip(texts, encoded_docs, strict=True):
             del text
@@ -386,7 +416,7 @@ def export_shards(
                 if fill == shard_size:
                     flush()
 
-        if stats["docs_total"] and stats["docs_total"] % 100_000 == 0:
+        if stats["docs_total"] and stats["docs_total"] % 10_000 == 0:
             print(f"{output_dir.name}: {stats['docs_total']}/{docs_total} docs", flush=True)
 
     flush()
@@ -398,11 +428,13 @@ def export_shards(
 def build_tokenizers(
     *,
     specs: list[dict[str, Any]],
-    docs_jsonl: Path,
+    docs_jsonl: Path | None,
     tokenizers_dir: Path,
     tokenizer_train_docs: int | None,
     skip_byte: bool,
     reuse_sp_models: dict[int, Path],
+    repo_id: str = "",
+    remote_root: str = "",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     tokenizers: list[dict[str, Any]] = []
     selected_specs: list[dict[str, Any]] = []
@@ -425,7 +457,7 @@ def build_tokenizers(
         built = (
             build_pure_byte_tokenizer(spec=spec, docs_jsonl=docs_jsonl, tokenizers_dir=tokenizers_dir)
             if kind == "byte"
-            else build_sentencepiece_tokenizer(spec=spec, docs_jsonl=docs_jsonl, tokenizers_dir=tokenizers_dir)
+            else build_sentencepiece_tokenizer(spec=spec, docs_jsonl=docs_jsonl, tokenizers_dir=tokenizers_dir, repo_id=repo_id, remote_root=remote_root)
         )
         name = str(built["name"])
         dataset_suffix = built.get("dataset_suffix")
@@ -501,6 +533,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Limit the number of docs used for tokenizer training.",
     )
+    parser.add_argument(
+        "--limit-docs",
+        type=int,
+        default=None,
+        help="Limit the total number of docs to process (streaming).",
+    )
     parser.add_argument("--skip-byte", action="store_true", help="Skip byte-tokenizer export.")
     parser.add_argument(
         "--reuse-sp-model",
@@ -526,42 +564,66 @@ def main() -> None:
 
     docs_jsonl = output_root / DOCS_FILENAME
     sidecar = output_root / SIDECAR_FILENAME
-    if not copy_from_hf_cache(
-        repo_id=args.repo_id,
-        remote_root=args.remote_root,
-        filename=DOCS_FILENAME,
-        destination=docs_jsonl,
-    ):
-        remote = f"{args.remote_root}/{DOCS_FILENAME}" if args.remote_root else DOCS_FILENAME
-        raise FileNotFoundError(f"{remote} not found in Hugging Face dataset repo {args.repo_id}")
-    if not copy_from_hf_cache(
+    
+    # Try to get docs locally, but don't fail if they aren't there - we can stream.
+    # Only attempt to copy from HF cache if we don't have a limit, or if the file already exists.
+    has_local_docs = docs_jsonl.exists()
+    if not has_local_docs and args.limit_docs is None:
+        has_local_docs = copy_from_hf_cache(
+            repo_id=args.repo_id,
+            remote_root=args.remote_root,
+            filename=DOCS_FILENAME,
+            destination=docs_jsonl,
+        )
+    
+    if not has_local_docs:
+        print("docs_selected.jsonl not found locally or limit_docs is set. Using streaming mode.")
+        docs_jsonl_ptr = None
+    else:
+        print(f"Using local docs: {docs_jsonl}")
+        docs_jsonl_ptr = docs_jsonl
+
+    copy_from_hf_cache(
         repo_id=args.repo_id,
         remote_root=args.remote_root,
         filename=SIDECAR_FILENAME,
         destination=sidecar,
-    ):
-        sidecar.unlink(missing_ok=True)
+    )
 
     docs_sidecar = maybe_load_docs_sidecar_meta(docs_jsonl)
-    docs_total = int(docs_sidecar["num_docs"]) if docs_sidecar is not None and docs_sidecar.get("num_docs") is not None else count_docs(docs_jsonl)
+    
+    if args.limit_docs is not None:
+        docs_total = args.limit_docs
+    elif docs_sidecar is not None and docs_sidecar.get("num_docs") is not None:
+        docs_total = int(docs_sidecar["num_docs"])
+    elif has_local_docs:
+        docs_total = count_docs(docs_jsonl)
+    else:
+        # If streaming and no limit, we need to know how many to expect or just use a default
+        docs_total = 100_000 # Default if streaming without limit
+        print(f"Streaming without limit. Defaulting to {docs_total} docs.")
+
     if args.num_val_docs is not None:
         num_val_docs = int(args.num_val_docs)
     elif docs_sidecar is not None and docs_sidecar.get("docs_val") is not None:
-        num_val_docs = int(docs_sidecar["docs_val"])
+        num_val_docs = min(int(docs_sidecar["docs_val"]), docs_total // 10)
     else:
-        num_val_docs = NUM_VAL_DOCS
+        num_val_docs = min(NUM_VAL_DOCS, docs_total // 10)
+    
     if not (0 <= num_val_docs <= docs_total):
-        raise ValueError(f"num_val_docs must be in [0, {docs_total}], got {num_val_docs}")
+        num_val_docs = docs_total // 10
 
     specs = load_specs(Path(args.tokenizer_config).expanduser().resolve())
     reuse_sp_models = parse_reuse_sp_models(args.reuse_sp_model)
     tokenizers, selected_specs = build_tokenizers(
         specs=specs,
-        docs_jsonl=docs_jsonl,
+        docs_jsonl=docs_jsonl_ptr,
         tokenizers_dir=tokenizers_dir,
         tokenizer_train_docs=args.tokenizer_train_docs,
         skip_byte=args.skip_byte,
         reuse_sp_models=reuse_sp_models,
+        repo_id=args.repo_id,
+        remote_root=args.remote_root,
     )
     write_tokenizer_config_export(output_root, selected_specs)
 
@@ -572,8 +634,6 @@ def main() -> None:
         "docs_sha256": None if docs_sidecar is None else docs_sidecar.get("docs_sha256"),
         "source_manifest": str(docs_sidecar_path(docs_jsonl)) if docs_sidecar is not None else None,
     }
-    if docs_sidecar is not None:
-        docs_meta["source_sidecar"] = docs_sidecar
 
     manifest = {
         "version": VERSION,
@@ -582,7 +642,7 @@ def main() -> None:
         "shuffle_seed": None if docs_sidecar is None else docs_sidecar.get("shuffle_seed"),
         "shard_size": int(args.chunk_tokens),
         "append_eos": APPEND_EOS,
-        "docs_jsonl": str(docs_jsonl),
+        "docs_jsonl": str(docs_jsonl) if has_local_docs else None,
         "docs_meta": docs_meta,
         "tokenizer_specs": selected_specs,
         "tokenizers": [],
@@ -593,12 +653,14 @@ def main() -> None:
         output_dir = datasets_dir / tok["dataset_name"]
         print(f"Exporting dataset: {tok['dataset_name']}", flush=True)
         stats = export_shards(
-            docs_jsonl,
+            docs_jsonl_ptr,
             tok,
             output_dir,
             num_val_docs=num_val_docs,
             shard_size=int(args.chunk_tokens),
             docs_total=docs_total,
+            repo_id=args.repo_id,
+            remote_root=args.remote_root,
         )
         manifest["tokenizers"].append(tok["manifest"])
         manifest["datasets"].append(

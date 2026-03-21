@@ -4,6 +4,11 @@
       "name": "sp_bpe_1024",
       "dataset_suffix": "sp1024",
       "vocab_size": 1024
+    },
+    {
+      "name": "sp_bpe_4096",
+      "dataset_suffix": "sp4096",
+      "vocab_size": 4096
     }
   ]
 }
