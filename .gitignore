@@ -9,3 +9,6 @@ data/docs_selected.jsonl
 .mypy_cache/
 .venv
 logs/
+explore/harnesses/*/results.tsv
+explore/harnesses/*/run.log
+explore/harnesses/*/.env

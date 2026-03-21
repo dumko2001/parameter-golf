@@ -40,21 +40,23 @@ COMPUTE_DTYPE = mx.bfloat16
 # - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent.parent.parent)
+
 class Hyperparameters:
-    # Data / tokenizer.
-    data_path: str = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
-    tokenizer_path: str = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    # Data / tokenizer — paths are absolute so this runs from any directory.
+    data_path: str = os.environ.get("DATA_PATH", f"{_REPO_ROOT}/data/datasets/fineweb10B_sp1024")
+    tokenizer_path: str = os.environ.get("TOKENIZER_PATH", f"{_REPO_ROOT}/data/tokenizers/fineweb_1024_bpe.model")
     run_id: str = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed: int = int(os.environ.get("SEED", 1337))
 
-    # Training loop. These defaults now mirror train_gpt.py on a single process.
-    iterations: int = int(os.environ.get("ITERATIONS", 20_000))
-    val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
-    # Validation always uses the full fineweb_val split.
-    val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
-    train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
+    # Training loop — smoke-test defaults for M1 (8GB).
+    # Full run values: ITERATIONS=20000, TRAIN_BATCH_TOKENS=524288, VAL_BATCH_SIZE=524288
+    iterations: int = int(os.environ.get("ITERATIONS", 200))
+    val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 100))
+    val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 16_384))
+    train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 50))
+    train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 8_192))
+    grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 1))
     train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 1024)))
     # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
     # memory pressure without changing the effective optimizer batch.
@@ -63,9 +65,9 @@ class Hyperparameters:
     # graph buildup across accumulation steps. Keeps peak memory low on 16GB machines.
     # Disable on 32GB+ unified memory for better throughput (MLX_EAGER_EVAL=0).
     mlx_eager_eval: bool = bool(int(os.environ.get("MLX_EAGER_EVAL", "1")))
-    warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
-    warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
-    max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 10))
+    warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 80))
+    max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 300.0))
 
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -870,8 +872,6 @@ def main() -> None:
         args.tokenizer_path,
     )
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
-    if (max_val_tokens := int(os.environ.get("MAX_VAL_TOKENS", 0))) > 0:
-        val_tokens = val_tokens[:max_val_tokens + 1]
 
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size
