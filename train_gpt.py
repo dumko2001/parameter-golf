@@ -316,6 +316,20 @@ INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 INT8_GROUP_SIZE = 128
 INT8_LOG_QUANT = False # Toggle logarithmic quantization
+INT8_HADAMARD = True  # Enable Hadamard transform before quantization
+
+def fwht_inplace(x: Tensor):
+    """In-place Fast Walsh-Hadamard Transform."""
+    d = x.shape[-1]
+    h = 1
+    while h < d:
+        for i in range(0, d, h * 2):
+            for j in range(i, i + h):
+                x_j = x[..., j].clone()
+                x[..., j] += x[..., j + h]
+                x[..., j + h] = x_j - x[..., j + h]
+        h *= 2
+    x /= math.sqrt(d)
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -331,6 +345,10 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     
+    # Hadamard transform to spread out outliers (only for power-of-2 widths)
+    if INT8_HADAMARD and t32.ndim == 2 and (t32.shape[-1] & (t32.shape[-1] - 1)) == 0:
+        fwht_inplace(t32)
+
     if INT8_LOG_QUANT:
         # Experimental log quantization for higher dynamic range
         eps = 1e-12
@@ -501,11 +519,15 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             svd_roots.add(root)
             u = dequantized[name]
             v = dequantized[root + ".svd_v"]
-            out[root] = (u @ v.T).contiguous()
-        elif ".svd_v" in name:
-            continue
-        else:
-            out[name] = dequantized[name]
+            dequantized[root] = (u @ v.T).contiguous()
+            del dequantized[name]
+            del dequantized[root + ".svd_v"]
+
+    # Apply inverse Hadamard (FWHT is its own inverse, except for scaling)
+    for name, t in dequantized.items():
+        if INT8_HADAMARD and t.ndim == 2 and (t.shape[-1] & (t.shape[-1] - 1)) == 0:
+            fwht_inplace(t)
+        out[name] = t
 
     for name, t in obj["passthrough"].items():
         # Restore small tensors, undoing the temporary fp16 storage cast if needed.
