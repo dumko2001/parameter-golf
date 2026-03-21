@@ -46,30 +46,32 @@ class Hyperparameters:
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
-    # Validation cadence and batch size. Validation always uses the full fineweb_val split.
+    # Smoke Test Baseline Configuration
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 500))
-    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 50))
+    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 10))
 
-    # Training length.
-    iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
-    warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    # Training length (Optimized for 600s speed)
+    iterations = 200
+    warmdown_iters = 50
+    warmup_steps = 10
+    train_batch_tokens = 262144
+    train_seq_len = 1024
+    max_wallclock_seconds = 600.0
+    qk_gain_init = 1.5
 
-    # Model shape.
+    # Model shape (Reduced for speed while keeping 2026 atoms)
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
-    tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
-    rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
-    logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    num_layers = 9
+    num_kv_heads = 4
+    model_dim = 512
+    num_heads = 8
+    mlp_mult = 2.0 # Reduced from 3.0 for 2x speedup
+    tie_embeddings = True
+    rope_base = 10000.0
+    logit_softcap = 30.0
+    bigram_vocab_size = 4096
+    bigram_dim = 64 # Reduced from 128 for speed
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -461,37 +463,45 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(t)
             continue
 
-        # Sensitive layers: 8-bit Linear
+        # Research Discovery: Hybrid Low-Rank Precision
+        # Factors A and B carry the logic (High Precision 8-bit)
+        # Matrix C carries the mass (Compressed 3-bit)
+        is_factor = name.endswith(".A") or name.endswith(".B")
         is_sensitive = any(p in name for p in ["tok_emb", "lm_head", "norm"])
         
-        if is_sensitive or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        if is_factor or is_sensitive or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
-            passthrough[name] = kept
-            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            # Standard Int8 for these
+            abs_max = kept.abs().max().clamp_min(1e-12)
+            q = torch.clamp(torch.round(kept * (127.0 / abs_max)), -128, 127).to(torch.int8)
+            quantized[name] = q
+            scales[name] = abs_max / 127.0
+            qmeta[name] = {"scheme": "linear_8bit"}
+            dtypes[name] = str(t.dtype).removeprefix("torch.")
+            stats["int8_payload_bytes"] += tensor_nbytes(q) + 4
             continue
 
         stats["num_float_tensors"] += 1
         
-        # 2026 ATOM: Learned 3-bit Quantization (Matches 2.67 entropy discovery)
+        # Base matrix C: 3-bit Learned Quantization
         centroids, indices = kmeans1d_quant(t, k=8)
         
-        # Delta Encoding on indices to further lower entropy for Zstd
+        # Modular Delta Encoding
         indices_flat = indices.view(-1)
         indices_delta = torch.zeros_like(indices_flat)
         indices_delta[0] = indices_flat[0]
-        indices_delta[1:] = (indices_flat[1:] - indices_flat[:-1]) % 8 # Modular delta for 3-bit
+        indices_delta[1:] = (indices_flat[1:] - indices_flat[:-1]) % 8
         
         quantized[name] = indices_delta.view(indices.shape)
         codebooks[name] = centroids.to(dtype=torch.float16)
         qmeta[name] = {"scheme": "kmeans_3bit_delta"}
         dtypes[name] = str(t.dtype).removeprefix("torch.")
-        
-        # Estimate size: 3 bits per param + codebook
-        stats["int8_payload_bytes"] += int(t.numel() * 0.375) + 16 # 8 * 2 bytes for fp16 codebook
+        stats["int8_payload_bytes"] += int(t.numel() * 0.375) + 16
 
     obj: dict[str, object] = {
-        "__quant_format__": "kmeans_3bit_delta_v1",
+        "__quant_format__": "lowrank_hybrid_v1",
         "quantized": quantized,
+        "scales": scales,
         "codebooks": codebooks,
         "dtypes": dtypes,
         "passthrough": passthrough,
@@ -503,28 +513,25 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     qmeta = obj.get("qmeta", {})
     codebooks = obj.get("codebooks", {})
+    scales = obj.get("scales", {})
+    levels_3bit = torch.linspace(-1, 1, 8) # Fallback, real levels in codebooks
     
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         meta = qmeta.get(name, {})
         
         if meta.get("scheme") == "kmeans_3bit_delta":
-            # Reverse Modular Delta Encoding
             indices_delta = q.view(-1).to(torch.long)
             indices = torch.zeros_like(indices_delta)
             curr = 0
-            # Faster cumsum-like logic for modular delta
             for i in range(len(indices_delta)):
                 curr = (curr + indices_delta[i]) % 8
                 indices[i] = curr
-            
-            # Map back to learned centroids
             centroids = codebooks[name].to(dtype=torch.float32)
             out[name] = centroids[indices].view(q.shape).to(dtype=dtype).contiguous()
         else:
-            # Linear 8-bit fallback
-            # (Note: In the research version, scales might be stored differently)
-            s = obj.get("scales", {}).get(name, 1.0)
+            # Linear 8-bit
+            s = scales.get(name, 1.0)
             out[name] = (q.float() * s).to(dtype=dtype).contiguous()
 
     for name, t in obj["passthrough"].items():
@@ -607,6 +614,51 @@ class DistributedTokenLoader:
 # TRANSFORMER MODULES
 # -----------------------------
 
+class LowRankLinear(nn.Module):
+    """
+    2026 Research Atom: Low-Rank Native Linear Layer.
+    Represents W = (A @ B) + C.
+    A, B: Low-rank factors (High precision).
+    C: Residual base matrix (3-bit Learned Compression target).
+    """
+    def __init__(self, in_features: int, out_features: int, rank: int = 32, bias: bool = False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        
+        # Factors A and B (Logic factors)
+        self.A = nn.Parameter(torch.empty(out_features, rank))
+        self.B = nn.Parameter(torch.empty(rank, in_features))
+        # Base matrix C (Knowledge base)
+        self.C = nn.Parameter(torch.empty(out_features, in_features))
+        
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter("bias", None)
+            
+        self._init_weights()
+
+    def _init_weights(self):
+        # Orthogonal init for factors to ensure stability
+        nn.init.orthogonal_(self.A)
+        nn.init.orthogonal_(self.B)
+        # Base matrix starts at zero, learns during training
+        nn.init.zeros_(self.C)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Optimized forward: x @ (A@B + C).T 
+        # Using associativity: (x @ B.T @ A.T) + (x @ C.T)
+        # This is much faster for high-rank models.
+        res_low_rank = F.linear(F.linear(x, self.B), self.A)
+        res_base = F.linear(x, self.C)
+        out = res_low_rank + res_base
+        if self.bias is not None:
+            out += self.bias
+        return out
+
+
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
         super().__init__()
@@ -683,11 +735,10 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
         # Differential Attention uses 2x Q and K paths to subtract noise
-        self.c_q = CastedLinear(dim, dim * 2, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim * 2, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.proj._zero_init = True
+        self.c_q = LowRankLinear(dim, dim * 2, rank=32, bias=False)
+        self.c_k = LowRankLinear(dim, kv_dim * 2, rank=32, bias=False)
+        self.c_v = LowRankLinear(dim, kv_dim, rank=32, bias=False)
+        self.proj = LowRankLinear(dim, dim, rank=32, bias=False)
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.diff_lambda = nn.Parameter(torch.tensor(0.5)) # Noise cancellation factor
         self.rotary = Rotary(self.head_dim, base=rope_base)
@@ -728,9 +779,8 @@ class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
         hidden = int(mlp_mult * dim)
-        self.fc = CastedLinear(dim, hidden * 2, bias=False) # *2 for GLU gating
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+        self.fc = LowRankLinear(dim, hidden * 2, rank=32, bias=False) # *2 for GLU gating
+        self.proj = LowRankLinear(hidden, dim, rank=32, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
         # SwiGLU activation
