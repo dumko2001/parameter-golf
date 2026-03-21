@@ -315,6 +315,7 @@ INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 INT8_GROUP_SIZE = 128
+INT8_LOG_QUANT = False # Toggle logarithmic quantization
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -329,6 +330,24 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
+    
+    if INT8_LOG_QUANT:
+        # Experimental log quantization for higher dynamic range
+        eps = 1e-12
+        clip_abs = torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item() if t32.numel() else 0.0
+        scale = torch.tensor(clip_abs if clip_abs > 0 else 1.0, dtype=torch.float32)
+        
+        # Normalize to [eps, 1.0]
+        t_norm = torch.clamp(t32.abs() / scale, eps, 1.0)
+        # log2(1.0)=0, log2(2^-8)=-8. We'll map a 256x range (8 bits)
+        log_range = 8.0 
+        # log_val in [-1, 0] for values in [2^-8, 1]
+        log_val = torch.log2(t_norm) / log_range
+        # Map to [0, 127]
+        q_mag = torch.clamp(torch.round((log_val + 1.0) * 127), 0, 127).to(torch.int8)
+        q = (q_mag * torch.sign(t32).to(torch.int8)).contiguous()
+        return q, scale
+
     if t32.ndim == 2:
         # Per-group quantization for better resolution
         rows, cols = t32.shape
@@ -449,7 +468,18 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
-        if s.ndim == 2:
+        
+        if INT8_LOG_QUANT:
+            # Reconstruct from log scale
+            s = s.to(dtype=torch.float32)
+            log_range = 8.0
+            q_mag = q.abs().float()
+            # Map [0, 127] -> [-1, 0]
+            log_val = (q_mag / 127.0) - 1.0
+            # mag = scale * 2^(log_val * log_range)
+            mag = s * torch.pow(2.0, log_val * log_range)
+            dequantized[name] = (mag * torch.sign(q.float())).to(dtype=dtype).contiguous()
+        elif s.ndim == 2:
             s = s.to(dtype=torch.float32)
             rows, cols = q.shape
             num_groups = s.shape[1]
