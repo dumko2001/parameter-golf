@@ -243,16 +243,6 @@ def write_tokenizer_config_export(output_root: Path, selected_specs: list[dict[s
     return path
 
 
-def _iter_sentencepiece_text(docs_jsonl: Path, *, max_docs: int | None = None):
-    with docs_jsonl.open("r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
-            if max_docs is not None and i >= max_docs:
-                break
-            text = json.loads(line)["text"].replace("\x00", " ").strip()
-            if text:
-                yield text
-
-
 def build_pure_byte_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tokenizers_dir: Path) -> dict[str, Any]:
     del docs_jsonl
     tok = default_pure_byte_tokenizer()
@@ -282,20 +272,27 @@ def build_sentencepiece_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path | No
     model_path = prefix.with_suffix(".model")
     vocab_path = prefix.with_suffix(".vocab")
     prefix.parent.mkdir(parents=True, exist_ok=True)
-    for artifact in (model_path, vocab_path):
-        if artifact.exists():
-            artifact.unlink()
 
     reuse_model_path = spec.get("reuse_model_path")
     if reuse_model_path is not None:
         reuse_model_path = Path(reuse_model_path).expanduser().resolve()
         if not reuse_model_path.is_file():
             raise FileNotFoundError(reuse_model_path)
-        shutil.copy2(reuse_model_path, model_path)
+        target_model = model_path.resolve()
+        # Reuse can legitimately point at the final output path. In that case we
+        # must keep the file in place instead of deleting/copying over itself.
+        if reuse_model_path != target_model:
+            for artifact in (model_path, vocab_path):
+                if artifact.exists():
+                    artifact.unlink()
+            shutil.copy2(reuse_model_path, model_path)
         reuse_vocab_path = reuse_model_path.with_suffix(".vocab")
-        if reuse_vocab_path.is_file():
+        if reuse_vocab_path.is_file() and reuse_vocab_path != vocab_path.resolve():
             shutil.copy2(reuse_vocab_path, vocab_path)
     else:
+        for artifact in (model_path, vocab_path):
+            if artifact.exists():
+                artifact.unlink()
         kwargs = {
             "sentence_iterator": _iter_sentencepiece_text(
                 docs_jsonl,
