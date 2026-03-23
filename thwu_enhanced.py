@@ -85,6 +85,7 @@ class Hyperparameters:
 
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+    ngram_cache_weight = float(os.environ.get("NGRAM_CACHE_WEIGHT", 3.0))
 
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
@@ -749,6 +750,54 @@ class GPT(nn.Module):
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
 
+BOS_ID = 1
+
+class NgramDocumentCache:
+    """Causal n-gram cache for document-local repetition boosting."""
+    def __init__(self, vocab_size: int, device: torch.device, weight: float = 3.0):
+        self.V = vocab_size
+        self.device = device
+        self.weight = weight
+        self.reset()
+
+    def reset(self) -> None:
+        self.unigram = torch.zeros(self.V, device=self.device, dtype=torch.float32)
+        self.bigram: dict[int, Tensor] = {}
+        self.trigram: dict[tuple[int, int], Tensor] = {}
+
+    def update(self, prev2: int, prev1: int, curr: int) -> None:
+        if curr == BOS_ID:
+            self.reset()
+            return
+        self.unigram[curr] += 1.0
+        if prev1 not in self.bigram:
+            self.bigram[prev1] = torch.zeros(self.V, device=self.device)
+        self.bigram[prev1][curr] += 1.0
+        key = (prev2, prev1)
+        if key not in self.trigram:
+            self.trigram[key] = torch.zeros(self.V, device=self.device)
+        self.trigram[key][curr] += 1.0
+
+    def logit_delta(self, prev2: int, prev1: int) -> Tensor:
+        delta = torch.zeros(self.V, device=self.device)
+        eps = 1e-8
+        key = (prev2, prev1)
+        if key in self.trigram:
+            c = self.trigram[key]
+            s = c.sum()
+            if s > 0:
+                delta += self.weight * 2.0 * ((c + eps) / (s + eps * self.V)).log().clamp(-10, 0)
+        if prev1 in self.bigram:
+            c = self.bigram[prev1]
+            s = c.sum()
+            if s > 0:
+                delta += self.weight * 1.0 * ((c + eps) / (s + eps * self.V)).log().clamp(-10, 0)
+        s_uni = self.unigram.sum()
+        if s_uni > 0:
+            delta += self.weight * 0.3 * ((self.unigram + eps) / (s_uni + eps * self.V)).log().clamp(-10, 0)
+        return delta
+
+
 def eval_val_sliding(
     args: Hyperparameters,
     base_model: nn.Module,
@@ -762,6 +811,7 @@ def eval_val_sliding(
     stride: int,
     batch_seqs: int = 32,
 ) -> tuple[float, float]:
+    """Sliding window evaluation with N-gram document cache."""
     seq_len = args.train_seq_len
     total_tokens = val_tokens.numel() - 1
     window_starts = [ws for ws in range(0, total_tokens, stride)
@@ -774,6 +824,9 @@ def eval_val_sliding(
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    cache = NgramDocumentCache(args.vocab_size, device, weight=getattr(args, "ngram_cache_weight", 3.0))
+    prev2, prev1 = 0, 0
 
     base_model.eval()
     with torch.inference_mode():
@@ -791,23 +844,34 @@ def eval_val_sliding(
                 x_batch[i, :wlen] = chunk[:-1]
                 y_batch[i, :wlen] = chunk[1:]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = base_model.forward_logits(x_batch)
-            nll = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).float(),
-                y_batch.reshape(-1),
-                reduction="none",
-            ).reshape(bsz, seq_len)
+                logits_batch = base_model.forward_logits(x_batch)
+
             for i, ws in enumerate(batch_ws):
                 wlen = wlens[i]
                 s = 0 if ws == 0 else max(wlen - stride, 0)
-                scored_nll = nll[i, s:wlen].to(torch.float64)
-                loss_sum += scored_nll.sum()
-                token_count += float(wlen - s)
-                tgt = y_batch[i, s:wlen]
-                prev = x_batch[i, s:wlen]
-                tb = base_bytes_lut[tgt].to(torch.float64)
-                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
-                byte_count += tb.sum()
+                logits = logits_batch[i]
+                
+                for t_idx in range(s, wlen):
+                    tgt = int(y_batch[i, t_idx].item())
+                    prev_tok = int(x_batch[i, t_idx].item())
+                    
+                    # Apply N-gram cache delta
+                    delta = cache.logit_delta(prev2, prev1)
+                    adjusted_logits = logits[t_idx] + delta
+                    
+                    loss_tok = F.cross_entropy(adjusted_logits.unsqueeze(0), torch.tensor([tgt], device=device))
+                    loss_sum += loss_tok.to(torch.float64)
+                    token_count += 1.0
+                    
+                    # Byte count
+                    tb = base_bytes_lut[tgt].to(torch.float64)
+                    tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev_tok]).to(torch.float64)
+                    byte_count += tb
+                    
+                    # Update cache
+                    cache.update(prev2, prev1, tgt)
+                    prev2, prev1 = prev1, tgt
+
             if rank == 0 and (bi // batch_seqs) % 50 == 0:
                 done = min(bi + batch_seqs, len(my_windows))
                 pct = done / len(my_windows) * 100
@@ -815,7 +879,7 @@ def eval_val_sliding(
                 if token_count.item() > 0:
                     rl = (loss_sum / token_count).item()
                     running_bpb = rl / math.log(2.0) * (token_count.item() / byte_count.item())
-                print(f"  sliding_eval [{pct:5.1f}%] {done}/{len(my_windows)} windows running_bpb={running_bpb:.6f}", flush=True)
+                print(f"  sliding_eval_ngram [{pct:5.1f}%] {done}/{len(my_windows)} windows running_bpb={running_bpb:.6f}", flush=True)
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
